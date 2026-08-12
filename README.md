@@ -109,11 +109,11 @@ python3 mfcmd.py -e <email> -p <password> -f <filepath> [options]
 
 | Flag | Long Flag | Description | Required | Default |
 |---|---|---|---|---|
-| `-e` | `--email` | Your MediaFire account email address [cite: 1]. | **Yes** | — |
-| `-p` | `--password` | Your MediaFire account password [cite: 1]. | **Yes** | — |
-| `-f` | `--file` | Path to the local file to upload [cite: 1]. | **Yes** | — |
-| `-u` | `--upload-folder` | Target folder name on MediaFire [cite: 1]. | No | `My Files` [cite: 1] |
-| `-h` | `--hash` | Pre-calculated SHA-256 string (skips local hash calculation) [cite: 1]. | No | Computed automatically [cite: 1] |
+| `-e` | `--email` | Your MediaFire account email address. | **Yes** | — |
+| `-p` | `--password` | Your MediaFire account password. | **Yes** | — |
+| `-f` | `--file` | Path to the local file to upload. | **Yes** | — |
+| `-u` | `--upload-folder` | Target folder name on MediaFire. | No | `My Files` |
+| `-h` | `--hash` | Pre-calculated SHA-256 string (skips local hash calculation). | No | Computed automatically |
 
 ---
 
@@ -152,13 +152,13 @@ python3 mfcmd.py \
 
 ## Exit Status Codes
 
-`mfcmd.py` returns standard exit codes for integration into shell scripts or CI/CD pipelines [cite: 1]:
+`mfcmd.py` returns standard exit codes for integration into shell scripts or CI/CD pipelines:
 
 | Code | Status | Meaning |
 |---|---|---|
-| `0` | **SUCCESS** | File uploaded or instant duplicate match found; URL printed to stdout [cite: 1]. |
-| `1` | **ERROR** | Validation failed, login rejected, or upload retries exhausted [cite: 1]. |
-| `130` | **INTERRUPTED** | Interrupted by user (`SIGINT` / `Ctrl+C`). Server retains uploaded units [cite: 1]. |
+| `0` | **SUCCESS** | File uploaded or instant duplicate match found; URL printed to stdout. |
+| `1` | **ERROR** | Validation failed, login rejected, or upload retries exhausted. |
+| `130` | **INTERRUPTED** | Interrupted by user (`SIGINT` / `Ctrl+C`). Server retains uploaded units. |
 
 ---
 

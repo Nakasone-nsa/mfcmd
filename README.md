@@ -88,7 +88,7 @@ It provides high-performance, fault-tolerant transfers for large files by levera
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/your-username/mfcmd.git
+   git clone https://github.com/bx758/mfcmd.git
    cd mfcmd
    ```
 

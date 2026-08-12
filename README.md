@@ -4,20 +4,20 @@
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![MediaFire SDK](https://img.shields.io/badge/mediafire-0.6.1-orange.svg)](https://pypi.org/project/mediafire/)
 
-`mfcmd.py` is a resilient, command-line resumable file uploader for **MediaFire**, engineered specifically for integration with the official `mediafire==0.6.1` Python Open SDK [cite: 1].
+`mfcmd.py` is a resilient, command-line resumable file uploader for **MediaFire**, engineered specifically for integration with the official `mediafire==0.6.1` Python Open SDK.
 
-It provides high-performance, fault-tolerant transfers for large files by leveraging chunked multi-unit uploads, automatic resume on network failure or manual interruption, SHA-256 block verification, instant server-side deduplication, and low memory consumption [cite: 1].
+It provides high-performance, fault-tolerant transfers for large files by leveraging chunked multi-unit uploads, automatic resume on network failure or manual interruption, SHA-256 block verification, instant server-side deduplication, and low memory consumption.
 
 ---
 
 ## Key Features
 
-* **Resumable Multi-Unit Uploads:** Automatically slices large files into server-specified unit sizes [cite: 1]. If an upload drops or is canceled (`Ctrl+C`), running the command again decodes MediaFire's unit bitmap and seamlessly resumes from the exact missing block [cite: 1].
-* **Instant Server-Side Deduplication:** Checks file hashes with MediaFire prior to uploading [cite: 1]. If an identical file already exists on MediaFire's servers, the file transfer is bypassed and the direct download URL is returned immediately [cite: 1].
-* **Memory Efficient (`UnitFile` Architecture):** Replaces `mediafire.subsetio.SubsetIO` with a custom isolated memory buffer [cite: 1]. Streams individual chunks without loading entire multi-gigabyte files into RAM [cite: 1].
-* **Per-Unit Automatic Retries:** Retries failed chunk uploads up to 5 times with exponential fallback before exiting, handling unstable connection issues smoothly [cite: 1].
-* **Terminal Progress Bar:** Displays real-time progress via `tqdm`, including current transfer speeds, ETA, elapsed time, percentage, and byte counters [cite: 1].
-* **Automated Polling & Finalization:** Listens to MediaFire's asynchronous processing queue after byte transmission finishes and outputs the final shareable public URL [cite: 1].
+* **Resumable Multi-Unit Uploads:** Automatically slices large files into server-specified unit sizes. If an upload drops or is canceled (`Ctrl+C`), running the command again decodes MediaFire's unit bitmap and seamlessly resumes from the exact missing block.
+* **Instant Server-Side Deduplication:** Checks file hashes with MediaFire prior to uploading. If an identical file already exists on MediaFire's servers, the file transfer is bypassed and the direct download URL is returned immediately.
+* **Memory Efficient (`UnitFile` Architecture):** Replaces `mediafire.subsetio.SubsetIO` with a custom isolated memory buffer. Streams individual chunks without loading entire multi-gigabyte files into RAM.
+* **Per-Unit Automatic Retries:** Retries failed chunk uploads up to 5 times with exponential fallback before exiting, handling unstable connection issues smoothly.
+* **Terminal Progress Bar:** Displays real-time progress via `tqdm`, including current transfer speeds, ETA, elapsed time, percentage, and byte counters.
+* **Automated Polling & Finalization:** Listens to MediaFire's asynchronous processing queue after byte transmission finishes and outputs the final shareable public URL.
 
 ---
 
@@ -67,11 +67,11 @@ It provides high-performance, fault-tolerant transfers for large files by levera
                                             └─────────────────┘
 ```
 
-1. **Authentication:** Connects to MediaFire using application ID `42511` [cite: 1].
-2. **Hash Check:** Calculates full-file SHA-256 and MD5 [cite: 1].
-3. **Bitmap Decoding:** Requests `upload/check` from MediaFire to parse the 15-bit integer word array representing which chunks already reside on the server [cite: 1].
-4. **Chunked Streaming:** Uploads missing chunks using `UnitFile` in-memory buffers [cite: 1].
-5. **Polling:** Monitors the `upload_key` via `upload/poll` until MediaFire assigns a `quickkey` and generates the public link [cite: 1].
+1. **Authentication:** Connects to MediaFire using application ID `42511`.
+2. **Hash Check:** Calculates full-file SHA-256 and MD5.
+3. **Bitmap Decoding:** Requests `upload/check` from MediaFire to parse the 15-bit integer word array representing which chunks already reside on the server.
+4. **Chunked Streaming:** Uploads missing chunks using `UnitFile` in-memory buffers.
+5. **Polling:** Monitors the `upload_key` via `upload/poll` until MediaFire assigns a `quickkey` and generates the public link.
 
 ---
 

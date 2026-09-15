@@ -2,58 +2,22 @@
 # -*- coding: utf-8 -*-
 
 """
-mfcmd.py v0.82
+mfcmd.py v0.86
 
-MediaFire resumable uploader for mediafire==0.6.1.
-
-Features:
-    - MediaFire SDK authentication
-    - app_id support
-    - SHA-256 / MD5 calculation
-    - MediaFire upload/check
-    - Instant upload when MediaFire already has the file
-    - Resumable uploads
-    - Resume after interruption
-    - MediaFire bitmap support
-    - No MediaFire SubsetIO
-    - Retry failed units
-    - Progress bar
-    - Final upload polling
-    - Download URL output
-
-Tested design target:
-    mediafire 0.6.1
-
-Example:
-
-    python3 mfcmd.py \
-        -e "your@email.com" \
-        -p "your-password" \
-        -f "large-file.zip"
-
-Optional folder:
-
-    python3 mfcmd.py \
-        -e "your@email.com" \
-        -p "your-password" \
-        -u "mfcmd" \
-        -f "large-file.zip"
-
-Optional SHA-256:
-
-    python3 mfcmd.py \
-        -e "your@email.com" \
-        -p "your-password" \
-        -h "sha256..." \
-        -f "large-file.zip"
+MediaFire resumable uploader com Parallel Unit Uploads,
+Clean Terminal UI, tratamento robusto de upload_key e suporte a Instant Upload.
 """
 
-import getopt
+import argparse
+import getpass
 import hashlib
 import io
+import logging
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote
 
 from tqdm import tqdm
@@ -64,361 +28,161 @@ from mediafire import MediaFireApi
 # Configuration
 # ============================================================================
 
-VERSION = "0.82"
-
-# MediaFire application ID used by the Python Open SDK.
+VERSION = "0.86"
 MEDIAFIRE_APP_ID = "42511"
-
-# Retry individual upload units this many times.
 UNIT_RETRIES = 5
-
-# Seconds between upload polling requests.
 POLL_INTERVAL = 5
-
-# Hashing buffer.
 HASH_BUFFER_SIZE = 1024 * 1024
-
-# Default MediaFire folder.
 DEFAULT_FOLDER = "My Files"
+MAX_PARALLEL_UPLOADS = 4
+LOG_FILE = "upload_mfcmd.log"
+
+auth_lock = threading.Lock()
 
 
 # ============================================================================
-# Console helpers
+# Logging Setup
 # ============================================================================
 
-def eprint(message=""):
-    print(message, file=sys.stderr)
+def setup_logger():
+    logger = logging.getLogger("mfcmd")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
 
+    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    return logger
+
+
+logger = setup_logger()
+
+
+def log_and_print(message="", to_console=False):
+    if message:
+        logger.info(message)
+    if to_console:
+        tqdm.write(message, file=sys.stderr)
+
+
+# ============================================================================
+# Console Helpers & Hashing
+# ============================================================================
 
 def human_size(value):
     value = float(value)
-
-    units = (
-        "B",
-        "KiB",
-        "MiB",
-        "GiB",
-        "TiB",
-    )
-
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
     for unit in units:
         if value < 1024:
             return f"{value:.2f} {unit}"
-
         value /= 1024
-
     return f"{value:.2f} PiB"
 
 
-# ============================================================================
-# File hashing
-# ============================================================================
-
 def calculate_file_hashes(filepath):
-    """
-    Calculate MD5 and SHA-256 for the complete file.
-    """
-
     md5 = hashlib.md5()
     sha256 = hashlib.sha256()
-
     total = 0
 
     with open(filepath, "rb") as fd:
-
         while True:
-
             data = fd.read(HASH_BUFFER_SIZE)
-
             if not data:
                 break
-
             md5.update(data)
             sha256.update(data)
-
             total += len(data)
 
-    return (
-        md5.hexdigest().lower(),
-        sha256.hexdigest().lower(),
-        total,
-    )
+    return md5.hexdigest().lower(), sha256.hexdigest().lower(), total
 
 
-# ============================================================================
-# Unit hashing
-# ============================================================================
-
-def calculate_unit_hashes(
-    filepath,
-    unit_size,
-    number_of_units,
-):
-    """
-    Calculate SHA-256 for every MediaFire resumable unit.
-
-    MediaFire tells us the unit size through upload/check.
-    """
-
+def calculate_unit_hashes(filepath, unit_size, number_of_units):
     hashes = []
-
-    eprint(
-        f"Calculating SHA-256 for "
-        f"{number_of_units} MediaFire units..."
-    )
+    logger.info(f"Calculating SHA-256 for {number_of_units} MediaFire units...")
 
     with open(filepath, "rb") as fd:
-
         while True:
-
             data = fd.read(unit_size)
-
             if not data:
                 break
-
             digest = hashlib.sha256(data).hexdigest().lower()
-
             hashes.append(digest)
 
     if len(hashes) != number_of_units:
-
         raise RuntimeError(
-            "MediaFire unit count mismatch: "
-            f"API returned {number_of_units}, "
-            f"but local file produced {len(hashes)}."
+            f"MediaFire unit count mismatch: API returned {number_of_units}, but local file produced {len(hashes)}."
         )
 
     return hashes
 
 
 # ============================================================================
-# MediaFire bitmap
+# MediaFire Bitmap & Auth
 # ============================================================================
 
 def decode_bitmap(bitmap_node, number_of_units):
-    """
-    Decode MediaFire's resumable upload bitmap.
-
-    This follows the same bitmap format used by
-    mediafire.uploader in version 0.6.1.
-    """
-
-    result = {
-        unit_id: False
-        for unit_id in range(number_of_units)
-    }
-
+    result = {unit_id: False for unit_id in range(number_of_units)}
     if not bitmap_node:
         return result
 
-    count = int(
-        bitmap_node.get("count", 0)
-    )
-
-    words = bitmap_node.get(
-        "words",
-        []
-    )
-
+    count = int(bitmap_node.get("count", 0))
+    words = bitmap_node.get("words", [])
     bitmap = 0
 
     for token_id in range(count):
-
         if token_id >= len(words):
             break
-
         value = int(words[token_id])
-
-        bitmap |= (
-            value << (0xF * token_id)
-        )
+        bitmap |= (value << (0xF * token_id))
 
     for unit_id in range(number_of_units):
-
         mask = 1 << unit_id
-
-        result[unit_id] = (
-            bitmap & mask
-        ) == mask
+        result[unit_id] = (bitmap & mask) == mask
 
     return result
 
 
-# ============================================================================
-# Authentication
-# ============================================================================
-
 def authenticate(email, password):
-    """
-    Authenticate using MediaFireApi 0.6.1.
-
-    IMPORTANT:
-        MediaFireApi() does not take app_id in its constructor.
-
-    Correct API:
-
-        api = MediaFireApi()
-
-        session = api.user_get_session_token(
-            app_id="42511",
-            email=email,
-            password=password
-        )
-
-        api.session = session
-    """
-
-    eprint(
-        "Authenticating with MediaFire SDK..."
-    )
-
+    logger.info("Authenticating with MediaFire SDK...")
     api = MediaFireApi()
-
-    session = api.user_get_session_token(
-        app_id=MEDIAFIRE_APP_ID,
-        email=email,
-        password=password,
-    )
+    session = api.user_get_session_token(app_id=MEDIAFIRE_APP_ID, email=email, password=password)
 
     if not session:
+        raise RuntimeError("MediaFire returned an empty session token.")
 
-        raise RuntimeError(
-            "MediaFire returned an empty session token."
-        )
-
-    # This is required by mediafire==0.6.1.
     api.session = session
-
-    eprint(
-        "MediaFire authentication successful."
-    )
-
+    logger.info("MediaFire authentication successful.")
     return api
 
 
-# ============================================================================
-# Account information
-# ============================================================================
-
-def print_account_info(api):
-
-    try:
-
-        response = api.user_get_info()
-
-        user_info = response.get(
-            "user_info",
-            {}
-        )
-
-        display_name = (
-            user_info.get("display_name")
-            or user_info.get("email")
-            or user_info.get("username")
-        )
-
-        if display_name:
-            eprint(
-                f"Account : {display_name}"
-            )
-
-    except Exception:
-        pass
-
-
-# ============================================================================
-# Folder lookup
-# ============================================================================
-
 def get_folder_key(api, folder_name):
-    """
-    Return a MediaFire folder key.
-
-    My Files is always represented by "myfiles".
-    """
-
-    if not folder_name:
+    if not folder_name or folder_name.lower() in ("my files", "myfiles"):
         return "myfiles"
 
-    if folder_name.lower() in (
-        "my files",
-        "myfiles",
-    ):
-        return "myfiles"
-
-    eprint(
-        f"Looking for MediaFire folder: {folder_name}"
-    )
-
+    logger.info(f"Searching MediaFire folder: {folder_name}")
     try:
-
-        result = api.folder_search(
-            search_text=folder_name,
-            folder_key="myfiles",
-        )
-
+        result = api.folder_search(search_text=folder_name, folder_key="myfiles")
     except Exception as exc:
+        raise RuntimeError(f"Folder search failed: {exc}")
 
-        raise RuntimeError(
-            f"Folder search failed: {exc}"
-        )
-
-    folder_content = result.get(
-        "folder_content",
-        {}
-    )
-
-    folders = folder_content.get(
-        "folders",
-        []
-    )
+    folder_content = result.get("folder_content", {})
+    folders = folder_content.get("folders", [])
 
     for folder in folders:
-
-        name = (
-            folder.get("name")
-            or folder.get("foldername")
-        )
-
+        name = folder.get("name") or folder.get("foldername")
         if name != folder_name:
             continue
-
-        folder_key = (
-            folder.get("folderkey")
-            or folder.get("folder_key")
-        )
-
+        folder_key = folder.get("folderkey") or folder.get("folder_key")
         if folder_key:
-
-            eprint(
-                f"Folder found: {folder_key}"
-            )
-
+            logger.info(f"Folder found: {folder_key}")
             return folder_key
 
-    raise RuntimeError(
-        f"MediaFire folder '{folder_name}' "
-        "was not found."
-    )
+    raise RuntimeError(f"MediaFire folder '{folder_name}' was not found.")
 
 
-# ============================================================================
-# Upload check
-# ============================================================================
-
-def mediafire_upload_check(
-    api,
-    filename,
-    filesize,
-    sha256_hash,
-    folder_key,
-):
-    """
-    Call MediaFire upload/check.
-
-    This is preferable to manually calling upload/instant.php.
-    """
-
+def mediafire_upload_check(api, filename, filesize, sha256_hash, folder_key):
     return api.upload_check(
         filename=filename,
         size=filesize,
@@ -428,796 +192,196 @@ def mediafire_upload_check(
     )
 
 
-# ============================================================================
-# In-memory MediaFire unit
-# ============================================================================
-
 class UnitFile(io.BytesIO):
-    """
-    Small file-like object used for ONE MediaFire upload unit.
-
-    The MediaFire 0.6.1 uploader expects the file-like object
-    to have a .len attribute.
-
-    Unlike SubsetIO, this object owns its underlying buffer and
-    therefore does not depend on the parent file descriptor.
-    """
-
     def __init__(self, data):
         super().__init__(data)
-
         self.len = len(data)
 
-    def close(self):
-        """
-        BytesIO.close() is safe, but keeping this method explicit
-        makes the ownership of the unit clear.
-        """
 
-        super().close()
-
-
-# ============================================================================
-# Read one file unit
-# ============================================================================
-
-def read_file_unit(
-    filepath,
-    offset,
-    size,
-):
-    """
-    Read one MediaFire unit.
-
-    Only one unit is loaded into memory.
-    The entire 4.24 GiB file is NEVER loaded.
-    """
-
+def read_file_unit(filepath, offset, size):
     with open(filepath, "rb") as fd:
-
-        fd.seek(
-            offset,
-            os.SEEK_SET
-        )
-
+        fd.seek(offset, os.SEEK_SET)
         data = fd.read(size)
-
     return data
 
 
-# ============================================================================
-# Upload one unit
-# ============================================================================
+def upload_unit(api, filepath, filesize, file_hash, unit_hash, unit_id, unit_size, folder_key, email, password):
+    offset = unit_id * unit_size
+    remaining = filesize - offset
+    actual_size = min(unit_size, remaining)
 
-def upload_unit(
-    api,
-    filepath,
-    filesize,
-    file_hash,
-    unit_hash,
-    unit_id,
-    unit_size,
-    folder_key,
-):
-    """
-    Upload a single MediaFire resumable unit.
-
-    This directly uses:
-
-        api.upload_resumable()
-
-    and completely bypasses:
-
-        mediafire.subsetio.SubsetIO
-    """
-
-    offset = (
-        unit_id
-        * unit_size
-    )
-
-    remaining = (
-        filesize
-        - offset
-    )
-
-    actual_size = min(
-        unit_size,
-        remaining
-    )
-
-    data = read_file_unit(
-        filepath,
-        offset,
-        actual_size
-    )
-
+    data = read_file_unit(filepath, offset, actual_size)
     if len(data) != actual_size:
+        raise IOError(f"Could not read unit {unit_id + 1}: expected {actual_size} bytes, got {len(data)}.")
 
-        raise IOError(
-            f"Could not read unit "
-            f"{unit_id + 1}: "
-            f"expected {actual_size} bytes, "
-            f"received {len(data)}."
-        )
-
-    # Verify unit hash locally.
-    actual_hash = hashlib.sha256(
-        data
-    ).hexdigest().lower()
-
+    actual_hash = hashlib.sha256(data).hexdigest().lower()
     if actual_hash != unit_hash:
-
-        raise RuntimeError(
-            f"Unit {unit_id + 1} SHA-256 mismatch."
-        )
+        raise RuntimeError(f"Unit {unit_id + 1} SHA-256 mismatch.")
 
     unit_fd = UnitFile(data)
-
     try:
-
         response = api.upload_resumable(
-            unit_fd,
-            filesize,
-            file_hash,
-            unit_hash,
-            unit_id,
-            actual_size,
-            folder_key=folder_key,
-            action_on_duplicate="keep",
+            unit_fd, filesize, file_hash, unit_hash, unit_id, actual_size,
+            folder_key=folder_key, action_on_duplicate="keep"
         )
+        
+        if isinstance(response, dict) and response.get("result") == "ERROR":
+            if int(response.get("error", 0)) == 105:
+                raise PermissionError("Session expired")
 
+    except Exception as exc:
+        if "105" in str(exc) or "expired" in str(exc).lower():
+            with auth_lock:
+                log_and_print(f"[Sessão Expirada] Renovando token na unidade {unit_id + 1}...", to_console=True)
+                session = api.user_get_session_token(app_id=MEDIAFIRE_APP_ID, email=email, password=password)
+                api.session = session
+            
+            unit_fd.seek(0)
+            response = api.upload_resumable(
+                unit_fd, filesize, file_hash, unit_hash, unit_id, actual_size,
+                folder_key=folder_key, action_on_duplicate="keep"
+            )
+        else:
+            raise exc
     finally:
-
         unit_fd.close()
 
     return response
 
 
-# ============================================================================
-# Upload polling
-# ============================================================================
-
 def poll_upload(api, upload_key):
-    """
-    Poll MediaFire until the upload receives a quickkey.
-    """
-
-    eprint()
-    eprint(
-        f"Upload key: {upload_key}"
-    )
-
-    eprint(
-        "Waiting for MediaFire to finalize the file..."
-    )
+    logger.info(f"Polling upload key: {upload_key}")
 
     while True:
+        response = api.upload_poll(upload_key)
+        doupload = response.get("doupload", {})
+        status = int(doupload.get("status", 0))
+        result_code = int(doupload.get("result", 0))
+        description = doupload.get("description", "")
 
-        response = api.upload_poll(
-            upload_key
-        )
+        logger.info(f"Polling Status: {status} | Result: {result_code} | Desc: {description}")
 
-        doupload = response.get(
-            "doupload",
-            {}
-        )
-
-        status = int(
-            doupload.get(
-                "status",
-                0
-            )
-        )
-
-        result_code = int(
-            doupload.get(
-                "result",
-                0
-            )
-        )
-
-        description = doupload.get(
-            "description",
-            ""
-        )
-
-        eprint(
-            f"MediaFire status: "
-            f"{status} | "
-            f"result: {result_code}"
-            + (
-                f" | {description}"
-                if description
-                else ""
-            )
-        )
-
-        file_error = doupload.get(
-            "fileerror"
-        )
-
+        file_error = doupload.get("fileerror")
         if file_error:
+            raise RuntimeError(f"MediaFire file error: {file_error}")
 
-            raise RuntimeError(
-                f"MediaFire file error: "
-                f"{file_error}"
-            )
-
-        quickkey = doupload.get(
-            "quickkey"
-        )
-
+        quickkey = doupload.get("quickkey")
         if quickkey:
-
             return doupload
 
         if result_code != 0:
+            raise RuntimeError(f"MediaFire upload polling failed: {doupload}")
 
-            raise RuntimeError(
-                "MediaFire upload polling failed: "
-                f"{doupload}"
-            )
+        time.sleep(POLL_INTERVAL)
 
-        time.sleep(
-            POLL_INTERVAL
-        )
+
+def make_mediafire_url(quickkey, filename):
+    return f"https://www.mediafire.com/file/{quote(str(quickkey), safe='')}/{quote(filename, safe='')}/file"
 
 
 # ============================================================================
-# URL
+# Main Program
 # ============================================================================
 
-def make_mediafire_url(
-    quickkey,
-    filename,
-):
-    return (
-        "https://www.mediafire.com/file/"
-        f"{quote(str(quickkey), safe='')}/"
-        f"{quote(filename, safe='')}/file"
-    )
+def main(argv=None):
+    logger.info(f"=== Starting mfcmd.py v{VERSION} ===")
 
+    parser = argparse.ArgumentParser(description="Envio otimizado de arquivos em partes para o MediaFire.")
+    parser.add_argument("-e", "--email", required=True, help="E-mail da sua conta MediaFire")
+    parser.add_argument("-p", "--password", help="Senha da conta")
+    parser.add_argument("-f", "--file", required=True, help="Caminho do arquivo local")
+    parser.add_argument("-u", "--upload-folder", default=DEFAULT_FOLDER, help="Pasta de destino")
+    parser.add_argument("-s", "--hash", dest="supplied_hash", help="Hash SHA-256 pré-calculado")
+    parser.add_argument("-t", "--threads", type=int, default=MAX_PARALLEL_UPLOADS, help="Uploads simultâneos")
 
-# ============================================================================
-# Main
-# ============================================================================
+    args = parser.parse_args(argv)
 
-def main(argv):
-
-    eprint(
-        f"mfcmd.py v{VERSION}"
-    )
-
-    email = ""
-    password = ""
-    filepath = ""
-    upload_folder = ""
-    supplied_hash = ""
-
-    # ------------------------------------------------------------------------
-    # Parse command line
-    # ------------------------------------------------------------------------
-
-    try:
-
-        opts, args = getopt.getopt(
-            argv,
-            "e:p:u:h:f:",
-            [
-                "email=",
-                "password=",
-                "upload-folder=",
-                "hash=",
-                "file=",
-            ],
-        )
-
-    except getopt.GetoptError as exc:
-
-        eprint(
-            f"Argument error: {exc}"
-        )
-
-        return 1
-
-    for opt, arg in opts:
-
-        if opt in (
-            "-e",
-            "--email",
-        ):
-
-            email = arg
-
-        elif opt in (
-            "-p",
-            "--password",
-        ):
-
-            password = arg
-
-        elif opt in (
-            "-u",
-            "--upload-folder",
-        ):
-
-            upload_folder = arg
-
-        elif opt in (
-            "-h",
-            "--hash",
-        ):
-
-            supplied_hash = arg.lower()
-
-        elif opt in (
-            "-f",
-            "--file",
-        ):
-
-            filepath = arg
-
-    # ------------------------------------------------------------------------
-    # Validate arguments
-    # ------------------------------------------------------------------------
-
-    if not email:
-
-        eprint(
-            "ERROR: email is required."
-        )
-
-        return 1
+    email = args.email
+    password = args.password or os.environ.get("MEDIAFIRE_PASSWORD")
 
     if not password:
+        try:
+            password = getpass.getpass("Senha do MediaFire: ")
+        except (KeyboardInterrupt, EOFError):
+            return 130
 
-        eprint(
-            "ERROR: password is required."
-        )
-
-        return 1
-
-    if not filepath:
-
-        eprint(
-            "ERROR: file is required."
-        )
-
-        return 1
-
-    filepath = os.path.abspath(
-        filepath
-    )
-
+    filepath = os.path.abspath(args.file)
     if not os.path.isfile(filepath):
-
-        eprint(
-            f"ERROR: File does not exist:\n"
-            f"{filepath}"
-        )
-
+        log_and_print(f"ERRO: O arquivo não existe: {filepath}", to_console=True)
         return 1
 
-    filename = os.path.basename(
-        filepath
-    )
-
-    filesize = os.path.getsize(
-        filepath
-    )
+    filename = os.path.basename(filepath)
+    filesize = os.path.getsize(filepath)
 
     if filesize <= 0:
-
-        eprint(
-            "ERROR: File is empty."
-        )
-
+        log_and_print("ERRO: O arquivo está vazio.", to_console=True)
         return 1
 
-    if not upload_folder:
+    upload_folder = args.upload_folder
+    supplied_hash = (args.supplied_hash or "").lower().strip()
+    parallel_threads = max(1, args.threads)
 
-        upload_folder = DEFAULT_FOLDER
+    log_and_print(f"Arquivo   : {filename}", to_console=True)
+    log_and_print(f"Tamanho   : {human_size(filesize)} | Threads: {parallel_threads}", to_console=True)
+    log_and_print(f"Log detalhado salvo em: {LOG_FILE}\n", to_console=True)
 
-    # ------------------------------------------------------------------------
-    # File information
-    # ------------------------------------------------------------------------
-
-    eprint()
-    eprint(
-        f"Filepath      : {filepath}"
-    )
-    eprint(
-        f"Filename      : {filename}"
-    )
-    eprint(
-        f"File size     : {human_size(filesize)}"
-    )
-    eprint(
-        f"Upload folder : {upload_folder}"
-    )
-
-    # ------------------------------------------------------------------------
-    # Hash file
-    # ------------------------------------------------------------------------
-
-    eprint()
-
-    eprint(
-        "Calculating MD5 and SHA-256..."
-    )
-
-    md5_hash, calculated_sha256, calculated_size = (
-        calculate_file_hashes(filepath)
-    )
+    logger.info("Calculando hashes MD5 e SHA-256...")
+    md5_hash, calculated_sha256, calculated_size = calculate_file_hashes(filepath)
 
     if calculated_size != filesize:
-
-        eprint(
-            "ERROR: File size changed while hashing."
-        )
-
+        log_and_print("ERRO: Tamanho do arquivo alterado durante a leitura.", to_console=True)
         return 1
 
-    if supplied_hash:
-
-        sha256_hash = supplied_hash
-
-        eprint(
-            "Using supplied SHA-256."
-        )
-
-    else:
-
-        sha256_hash = calculated_sha256
-
-    eprint(
-        f"MD5     : {md5_hash}"
-    )
-
-    eprint(
-        f"SHA-256 : {sha256_hash}"
-    )
-
-    # ------------------------------------------------------------------------
-    # Authentication
-    # ------------------------------------------------------------------------
+    sha256_hash = supplied_hash if supplied_hash else calculated_sha256
+    logger.info(f"MD5: {md5_hash} | SHA-256: {sha256_hash}")
 
     try:
-
-        api = authenticate(
-            email,
-            password
-        )
-
+        api = authenticate(email, password)
+        folder_key = get_folder_key(api, upload_folder)
+        check = mediafire_upload_check(api, filename, filesize, sha256_hash, folder_key)
     except Exception as exc:
-
-        eprint()
-        eprint(
-            f"Login Error: {exc}"
-        )
-
+        log_and_print(f"Erro na conexão com MediaFire: {exc}", to_console=True)
         return 1
 
-    print_account_info(api)
-
-    eprint(
-        "MediaFire API: Connected"
-    )
-
-    # ------------------------------------------------------------------------
-    # Folder
-    # ------------------------------------------------------------------------
-
-    try:
-
-        folder_key = get_folder_key(
-            api,
-            upload_folder
-        )
-
-    except Exception as exc:
-
-        eprint()
-        eprint(
-            f"Folder Error: {exc}"
-        )
-
-        return 1
-
-    eprint(
-        f"Folder key   : {folder_key}"
-    )
-
-    # ------------------------------------------------------------------------
-    # MediaFire upload/check
-    # ------------------------------------------------------------------------
-
-    eprint()
-
-    eprint(
-        "Checking MediaFire upload state..."
-    )
-
-    try:
-
-        check = mediafire_upload_check(
-            api,
-            filename,
-            filesize,
-            sha256_hash,
-            folder_key
-        )
-
-    except Exception as exc:
-
-        eprint()
-        eprint(
-            f"MediaFire upload/check failed: {exc}"
-        )
-
-        return 1
-
-    # ------------------------------------------------------------------------
-    # Existing file
-    # ------------------------------------------------------------------------
-
-    hash_exists = (
-        check.get("hash_exists")
-        == "yes"
-    )
-
-    in_folder = (
-        check.get("in_folder")
-        == "yes"
-    )
-
-    file_exists = (
-        check.get("file_exists")
-        == "yes"
-    )
-
-    different_hash = (
-        check.get(
-            "different_hash",
-            "no"
-        )
-        == "yes"
-    )
-
-    if (
-        hash_exists
-        and in_folder
-        and file_exists
-        and not different_hash
-    ):
-
-        quickkey = check.get(
-            "duplicate_quickkey"
-        )
-
+    if check.get("hash_exists") == "yes" and check.get("in_folder") == "yes":
+        quickkey = check.get("duplicate_quickkey")
         if quickkey:
-
-            eprint()
-            eprint(
-                "File already exists on MediaFire."
-            )
-
-            print(
-                make_mediafire_url(
-                    quickkey,
-                    filename
-                )
-            )
-
+            log_and_print("Arquivo já existe no MediaFire.", to_console=True)
+            print(make_mediafire_url(quickkey, filename))
             return 0
 
-    # ------------------------------------------------------------------------
-    # Instant upload if MediaFire already has identical content elsewhere
-    # ------------------------------------------------------------------------
-
-    if hash_exists and not in_folder:
-
-        eprint()
-        eprint(
-            "MediaFire already has this file."
-        )
-
-        eprint(
-            "Attempting instant upload..."
-        )
-
+    if check.get("hash_exists") == "yes" and check.get("in_folder") != "yes":
+        logger.info("Tentando upload instantâneo (Instant Upload)...")
         try:
-
-            instant = api.upload_instant(
-                filename,
-                filesize,
-                sha256_hash,
-                folder_key=folder_key,
-                action_on_duplicate="keep"
-            )
-
-            quickkey = instant.get(
-                "quickkey"
-            )
-
+            instant = api.upload_instant(filename, filesize, sha256_hash, folder_key=folder_key, action_on_duplicate="keep")
+            quickkey = instant.get("quickkey")
             if quickkey:
-
-                eprint(
-                    "Instant upload successful."
-                )
-
-                print(
-                    make_mediafire_url(
-                        quickkey,
-                        filename
-                    )
-                )
-
+                log_and_print("Upload instantâneo concluído com sucesso!", to_console=True)
+                print(make_mediafire_url(quickkey, filename))
                 return 0
-
         except Exception as exc:
+            logger.warning(f"Upload instantâneo indisponível: {exc}")
 
-            eprint(
-                f"Instant upload unavailable: {exc}"
-            )
-
-            eprint(
-                "Continuing with resumable upload."
-            )
-
-    # ------------------------------------------------------------------------
-    # Resumable information
-    # ------------------------------------------------------------------------
-
-    resumable = check.get(
-        "resumable_upload"
-    )
-
+    resumable = check.get("resumable_upload")
     if not resumable:
-
-        eprint()
-        eprint(
-            "ERROR: MediaFire did not provide "
-            "resumable upload information."
-        )
-
-        eprint(
-            f"MediaFire response: {check}"
-        )
-
+        log_and_print("ERRO: Informações de upload resumível indisponíveis.", to_console=True)
         return 1
 
-    try:
+    unit_size = int(resumable["unit_size"])
+    number_of_units = int(resumable["number_of_units"])
 
-        unit_size = int(
-            resumable[
-                "unit_size"
-            ]
-        )
+    logger.info(f"Upload resumível: {number_of_units} partes de {human_size(unit_size)}")
+    unit_hashes = calculate_unit_hashes(filepath, unit_size, number_of_units)
 
-        number_of_units = int(
-            resumable[
-                "number_of_units"
-            ]
-        )
-
-    except (
-        KeyError,
-        TypeError,
-        ValueError
-    ) as exc:
-
-        eprint()
-        eprint(
-            "ERROR: Invalid MediaFire resumable "
-            f"upload information: {exc}"
-        )
-
-        eprint(
-            f"Response: {resumable}"
-        )
-
-        return 1
-
-    eprint()
-    eprint(
-        "MediaFire resumable upload parameters:"
-    )
-
-    eprint(
-        f"Unit size    : {human_size(unit_size)}"
-    )
-
-    eprint(
-        f"Unit count   : {number_of_units}"
-    )
-
-    eprint(
-        f"Expected file: {human_size(filesize)}"
-    )
-
-    # ------------------------------------------------------------------------
-    # Calculate unit hashes
-    # ------------------------------------------------------------------------
-
-    try:
-
-        unit_hashes = calculate_unit_hashes(
-            filepath,
-            unit_size,
-            number_of_units
-        )
-
-    except Exception as exc:
-
-        eprint()
-        eprint(
-            f"Unit hash calculation failed: {exc}"
-        )
-
-        return 1
-
-    # ------------------------------------------------------------------------
-    # Decode MediaFire's resume bitmap
-    # ------------------------------------------------------------------------
-
-    bitmap = decode_bitmap(
-        resumable.get("bitmap"),
-        number_of_units
-    )
-
-    uploaded_units = [
-        unit_id
-        for unit_id, uploaded
-        in bitmap.items()
-        if uploaded
-    ]
-
-    uploaded_bytes = 0
-
-    for unit_id in uploaded_units:
-
-        offset = unit_id * unit_size
-
-        uploaded_bytes += min(
-            unit_size,
-            max(
-                0,
-                filesize - offset
-            )
-        )
-
-    eprint()
-    eprint(
-        f"Already uploaded: "
-        f"{len(uploaded_units)}/{number_of_units} units"
-    )
+    bitmap = decode_bitmap(resumable.get("bitmap"), number_of_units)
+    uploaded_units = [u for u, uploaded in bitmap.items() if uploaded]
+    uploaded_bytes = sum(min(unit_size, max(0, filesize - u * unit_size)) for u in uploaded_units)
 
     if uploaded_units:
+        log_and_print(f"Retomando envio: {len(uploaded_units)}/{number_of_units} partes já enviadas.", to_console=True)
 
-        eprint(
-            f"Already uploaded: "
-            f"{human_size(uploaded_bytes)}"
-        )
-
-    # ------------------------------------------------------------------------
-    # If all units already exist, get upload key if possible.
-    # ------------------------------------------------------------------------
-
-    all_ready = (
-        resumable.get(
-            "all_units_ready",
-            "no"
-        )
-        == "yes"
-    )
-
-    upload_key = None
-
-    # ------------------------------------------------------------------------
-    # Progress bar
-    # ------------------------------------------------------------------------
+    upload_key = resumable.get("key") or check.get("upload_key")
+    lock = threading.Lock()
 
     progress = tqdm(
         total=filesize,
@@ -1225,416 +389,116 @@ def main(argv):
         unit="B",
         unit_scale=True,
         unit_divisor=1024,
-        desc=f"Uploading {filename}",
-        bar_format=(
-            "{desc}: "
-            "{percentage:3.0f}%|{bar}| "
-            "{n_fmt}/{total_fmt} "
-            "[{elapsed}<{remaining}, {rate_fmt}]"
-        ),
-        file=sys.stderr
+        desc="Enviando",
+        bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+        file=sys.stderr,
     )
 
-    # ------------------------------------------------------------------------
-    # Upload missing units
-    # ------------------------------------------------------------------------
+    pending_units = [u for u in range(number_of_units) if not bitmap.get(u, False)]
 
-    try:
+    def worker(unit_id):
+        nonlocal upload_key
+        offset = unit_id * unit_size
+        actual_size = min(unit_size, filesize - offset)
 
-        for unit_id in range(
-            number_of_units
-        ):
-
-            if bitmap.get(
-                unit_id,
-                False
-            ):
-
-                continue
-
-            offset = (
-                unit_id
-                * unit_size
-            )
-
-            actual_size = min(
-                unit_size,
-                filesize - offset
-            )
-
-            eprint()
-            eprint(
-                f"Uploading unit "
-                f"{unit_id + 1}/"
-                f"{number_of_units} "
-                f"({human_size(actual_size)})"
-            )
-
-            success = False
-
-            last_error = None
-
-            for attempt in range(
-                1,
-                UNIT_RETRIES + 1
-            ):
-
-                try:
-
-                    response = upload_unit(
-                        api=api,
-                        filepath=filepath,
-                        filesize=filesize,
-                        file_hash=sha256_hash,
-                        unit_hash=unit_hashes[
-                            unit_id
-                        ],
-                        unit_id=unit_id,
-                        unit_size=unit_size,
-                        folder_key=folder_key
-                    )
-
-                    # MediaFire normally returns the upload key
-                    # inside doupload.
-                    doupload = response.get(
-                        "doupload",
-                        {}
-                    )
-
-                    candidate_key = (
-                        doupload.get("key")
-                        or response.get("key")
-                    )
-
-                    if candidate_key:
-
-                        upload_key = candidate_key
-
-                    success = True
-
-                    progress.update(
-                        actual_size
-                    )
-
-                    eprint(
-                        f"Unit {unit_id + 1} "
-                        f"uploaded successfully."
-                    )
-
-                    break
-
-                except KeyboardInterrupt:
-
-                    raise
-
-                except Exception as exc:
-
-                    last_error = exc
-
-                    eprint(
-                        f"Unit {unit_id + 1} "
-                        f"attempt "
-                        f"{attempt}/{UNIT_RETRIES} "
-                        f"failed: {exc}"
-                    )
-
-                    if attempt < UNIT_RETRIES:
-
-                        time.sleep(3)
-
-            if not success:
-
-                raise RuntimeError(
-                    f"Failed to upload unit "
-                    f"{unit_id + 1} after "
-                    f"{UNIT_RETRIES} attempts: "
-                    f"{last_error}"
+        for attempt in range(1, UNIT_RETRIES + 1):
+            try:
+                response = upload_unit(
+                    api=api, filepath=filepath, filesize=filesize, file_hash=sha256_hash,
+                    unit_hash=unit_hashes[unit_id], unit_id=unit_id, unit_size=unit_size,
+                    folder_key=folder_key, email=email, password=password
                 )
 
-    except KeyboardInterrupt:
+                candidate_key = (
+                    response.get("doupload", {}).get("key") 
+                    or response.get("key") 
+                    or response.get("resumable_upload", {}).get("key")
+                )
+                with lock:
+                    if candidate_key:
+                        upload_key = candidate_key
+                    progress.update(actual_size)
+                return True
+            except Exception as exc:
+                logger.warning(f"Tentativa {attempt} para unidade {unit_id + 1} falhou: {exc}")
+                if attempt < UNIT_RETRIES:
+                    time.sleep(2)
 
-        progress.close()
-
-        eprint()
-        eprint(
-            "Upload interrupted by user."
-        )
-
-        eprint(
-            "MediaFire keeps successfully uploaded "
-            "units on the server."
-        )
-
-        eprint(
-            "Run the same command again to resume."
-        )
-
-        return 130
-
-    except Exception as exc:
-
-        progress.close()
-
-        eprint()
-        eprint(
-            f"Upload failed: {exc}"
-        )
-
-        return 1
-
-    finally:
-
-        progress.close()
-
-    # ------------------------------------------------------------------------
-    # Verify upload/check again
-    # ------------------------------------------------------------------------
-
-    eprint()
-    eprint(
-        "Data transfer finished."
-    )
-
-    eprint(
-        "Verifying MediaFire upload bitmap..."
-    )
+        raise RuntimeError(f"Unidade {unit_id + 1} falhou após {UNIT_RETRIES} tentativas.")
 
     try:
-
-        final_check = mediafire_upload_check(
-            api,
-            filename,
-            filesize,
-            sha256_hash,
-            folder_key
-        )
-
+        if pending_units:
+            with ThreadPoolExecutor(max_workers=parallel_threads) as executor:
+                futures = [executor.submit(worker, u) for u in pending_units]
+                for future in as_completed(futures):
+                    future.result()
     except Exception as exc:
-
-        eprint(
-            f"Final upload/check failed: {exc}"
-        )
-
+        progress.close()
+        log_and_print(f"\nFalha durante o upload: {exc}", to_console=True)
         return 1
+    finally:
+        progress.close()
 
-    final_resumable = final_check.get(
-        "resumable_upload"
-    )
+    logger.info("Transferência concluída. Verificando estado final no MediaFire...")
 
-    if not final_resumable:
+    try:
+        final_check = mediafire_upload_check(api, filename, filesize, sha256_hash, folder_key)
+    except Exception as exc:
+        if "105" in str(exc) or "expired" in str(exc).lower():
+            logger.info("Renovando sessão para verificação final...")
+            api.session = api.user_get_session_token(app_id=MEDIAFIRE_APP_ID, email=email, password=password)
+            final_check = mediafire_upload_check(api, filename, filesize, sha256_hash, folder_key)
+        else:
+            log_and_print(f"Erro na verificação final: {exc}", to_console=True)
+            return 1
 
-        eprint(
-            "ERROR: MediaFire returned no "
-            "resumable state after upload."
-        )
-
-        return 1
-
-    final_unit_count = int(
-        final_resumable.get(
-            "number_of_units",
-            number_of_units
-        )
-    )
-
-    final_bitmap = decode_bitmap(
-        final_resumable.get(
-            "bitmap"
-        ),
-        final_unit_count
-    )
-
-    missing_units = [
-        unit_id + 1
-        for unit_id, uploaded
-        in final_bitmap.items()
-        if not uploaded
-    ]
-
-    final_all_ready = (
-        final_resumable.get(
-            "all_units_ready",
-            "no"
-        )
-        == "yes"
-    )
-
-    if not final_all_ready:
-
-        eprint()
-        eprint(
-            "MediaFire does not yet consider "
-            "all units uploaded."
-        )
-
-        eprint(
-            f"Missing units: {missing_units}"
-        )
-
-        eprint(
-            "Run the command again to resume."
-        )
-
-        return 1
-
-    eprint(
-        "MediaFire reports all units are ready."
-    )
-
-    # ------------------------------------------------------------------------
-    # Upload key
-    # ------------------------------------------------------------------------
+    final_resumable = final_check.get("resumable_upload", {})
+    if not upload_key:
+        upload_key = final_resumable.get("key") or final_check.get("upload_key")
 
     if not upload_key:
-
-        eprint()
-        eprint(
-            "WARNING: No upload key was returned "
-            "during unit uploads."
-        )
-
-        eprint(
-            "The data is on MediaFire, but this "
-            "process cannot safely poll it without "
-            "the upload key."
-        )
-
-        eprint(
-            "Run the command again. MediaFire should "
-            "recognize the completed upload."
-        )
-
+        log_and_print("Erro: Nenhuma chave de upload foi retornada pela API do MediaFire.", to_console=True)
         return 1
-
-    # ------------------------------------------------------------------------
-    # Poll
-    # ------------------------------------------------------------------------
 
     try:
-
-        final_result = poll_upload(
-            api,
-            upload_key
-        )
-
-    except KeyboardInterrupt:
-
-        eprint()
-        eprint(
-            "Polling interrupted."
-        )
-
-        eprint(
-            "The upload data remains on MediaFire."
-        )
-
-        return 130
-
+        final_result = poll_upload(api, upload_key)
     except Exception as exc:
-
-        eprint()
-        eprint(
-            f"Upload polling failed: {exc}"
-        )
-
+        log_and_print(f"Erro ao aguardar processamento final: {exc}", to_console=True)
         return 1
 
-    # ------------------------------------------------------------------------
-    # Quickkey
-    # ------------------------------------------------------------------------
-
-    quickkey = final_result.get(
-        "quickkey"
-    )
-
+    quickkey = final_result.get("quickkey")
     if not quickkey:
-
-        eprint()
-        eprint(
-            "MediaFire finalized the request but "
-            "returned no quickkey."
-        )
-
-        eprint(
-            f"MediaFire response: {final_result}"
-        )
-
+        log_and_print("Erro: MediaFire não retornou a chave de download.", to_console=True)
         return 1
 
-    # ------------------------------------------------------------------------
-    # Success
-    # ------------------------------------------------------------------------
+    download_url = make_mediafire_url(quickkey, filename)
 
-    download_url = make_mediafire_url(
-        quickkey,
-        filename
-    )
+    logger.info("============================================================")
+    logger.info("UPLOAD CONCLUÍDO COM SUCESSO!")
+    logger.info(f"Arquivo  : {filename}")
+    logger.info(f"Quickkey : {quickkey}")
+    logger.info(f"Link     : {download_url}")
+    logger.info("============================================================")
 
-    eprint()
-    eprint(
-        "============================================================"
-    )
-    eprint(
-        "UPLOAD SUCCESSFUL"
-    )
-    eprint(
-        "============================================================"
-    )
-    eprint(
-        f"Filename : {filename}"
-    )
-    eprint(
-        f"Size     : {human_size(filesize)}"
-    )
-    eprint(
-        f"Quickkey : {quickkey}"
-    )
-    eprint()
-    eprint(
-        "Download URL:"
-    )
-
-    print(
-        download_url
-    )
+    print("\n============================================================", file=sys.stderr)
+    print("UPLOAD CONCLUÍDO COM SUCESSO!", file=sys.stderr)
+    print("============================================================", file=sys.stderr)
+    print(f"Arquivo  : {filename}", file=sys.stderr)
+    print(f"Quickkey : {quickkey}\n", file=sys.stderr)
+    print("Link de Download:", file=sys.stderr)
+    print(download_url)
 
     return 0
 
 
-# ============================================================================
-# Entry point
-# ============================================================================
-
 if __name__ == "__main__":
-
     try:
-
-        exit_code = main(
-            sys.argv[1:]
-        )
-
+        exit_code = main(sys.argv[1:])
     except KeyboardInterrupt:
-
-        eprint()
-        eprint(
-            "Interrupted by user."
-        )
-
+        log_and_print("\nOperação interrompida pelo usuário.", to_console=True)
         exit_code = 130
-
     except Exception as exc:
-
-        eprint()
-        eprint(
-            f"FATAL ERROR: {exc}"
-        )
-
+        log_and_print(f"\nERRO FATAL: {exc}", to_console=True)
         exit_code = 1
 
-    eprint(
-        "Done."
-    )
-
-    sys.exit(
-        exit_code
-    )
+    sys.exit(exit_code)

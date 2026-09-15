@@ -80,7 +80,7 @@ O **`mfcmd`** é um utilitário CLI (linha de comando) de alta performance, resi
 
 1. **Clone o repositório:**
    ```bash
-   git clone [https://github.com/bx758/mfcmd.git](https://github.com/bx758/mfcmd.git)
+   git clone [https://github.com/Nakasone-nsa/mfcmd.git](https://github.com/Nakasone-nsa/mfcmd.git)
    cd mfcmd
    ```
 

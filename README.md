@@ -94,7 +94,7 @@ O **`mfcmd`** é um utilitário CLI (linha de comando) de alta performance, resi
 ## 💻 Como Usar
 
 ```bash
-python3 mfcmd.py -e <email> [-p <senha>] -f <caminho_do_arquivo> [opções]
+py mfcmd.py -e <email> [-p <senha>] -f <caminho_do_arquivo> [opções]
 ```
 
 ### 📋 Parâmetros e Sinalizadores (Flags)

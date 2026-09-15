@@ -25,7 +25,7 @@ from mediafire import MediaFireApi
 
 
 # ============================================================================
-# Configuration
+# Configuration | Configuração
 # ============================================================================
 
 VERSION = "0.86"
@@ -41,7 +41,7 @@ auth_lock = threading.Lock()
 
 
 # ============================================================================
-# Logging Setup
+# Logging Setup | Configuração de Registro
 # ============================================================================
 
 def setup_logger():
@@ -68,7 +68,7 @@ def log_and_print(message="", to_console=False):
 
 
 # ============================================================================
-# Console Helpers & Hashing
+# Console Helpers & Hashing | Auxiliares de Console e Hashing 
 # ============================================================================
 
 def human_size(value):
@@ -119,7 +119,7 @@ def calculate_unit_hashes(filepath, unit_size, number_of_units):
 
 
 # ============================================================================
-# MediaFire Bitmap & Auth
+# MediaFire Bitmap & Auth | Bitmap e Autenticação do MediaFire
 # ============================================================================
 
 def decode_bitmap(bitmap_node, number_of_units):
@@ -280,7 +280,7 @@ def make_mediafire_url(quickkey, filename):
 
 
 # ============================================================================
-# Main Program
+# Main Program | Programa Principal
 # ============================================================================
 
 def main(argv=None):

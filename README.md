@@ -1,167 +1,163 @@
-# mfcmd
+# 🚀 mfcmd
 
-[![Python Version](https://img.shields.io/badge/python-3.6%2B-blue.svg)](https://www.python.org/)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![MediaFire SDK](https://img.shields.io/badge/mediafire-0.6.1-orange.svg)](https://pypi.org/project/mediafire/)
+[![Python Version](https://img.shields.io/badge/python-3.6%2B-blue.svg?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-MIT-green.svg?style=for-the-badge)](LICENSE)
+[![MediaFire SDK](https://img.shields.io/badge/mediafire-0.6.1-orange.svg?style=for-the-badge)](https://pypi.org/project/mediafire/)
 
-`mfcmd.py` is a resilient, command-line resumable file uploader for **MediaFire**, engineered specifically for integration with the official `mediafire==0.6.1` Python Open SDK.
-
-It provides high-performance, fault-tolerant transfers for large files by leveraging chunked multi-unit uploads, automatic resume on network failure or manual interruption, SHA-256 block verification, instant server-side deduplication, and low memory consumption.
+O **`mfcmd`** é um utilitário CLI (linha de comando) de alta performance, resiliente e totalmente automatizado para envio de arquivos grandes para o **MediaFire**. Desenvolvido em Python sobre o SDK oficial `mediafire==0.6.1`, o script foi projetado para garantir máxima velocidade, estabilidade e tolerância a falhas em conexões oscilantes.
 
 ---
 
-## Key Features
+## 🌟 Principais Recursos
 
-* **Resumable Multi-Unit Uploads:** Automatically slices large files into server-specified unit sizes. If an upload drops or is canceled (`Ctrl+C`), running the command again decodes MediaFire's unit bitmap and seamlessly resumes from the exact missing block.
-* **Instant Server-Side Deduplication:** Checks file hashes with MediaFire prior to uploading. If an identical file already exists on MediaFire's servers, the file transfer is bypassed and the direct download URL is returned immediately.
-* **Memory Efficient (`UnitFile` Architecture):** Replaces `mediafire.subsetio.SubsetIO` with a custom isolated memory buffer. Streams individual chunks without loading entire multi-gigabyte files into RAM.
-* **Per-Unit Automatic Retries:** Retries failed chunk uploads up to 5 times with exponential fallback before exiting, handling unstable connection issues smoothly.
-* **Terminal Progress Bar:** Displays real-time progress via `tqdm`, including current transfer speeds, ETA, elapsed time, percentage, and byte counters.
-* **Automated Polling & Finalization:** Listens to MediaFire's asynchronous processing queue after byte transmission finishes and outputs the final shareable public URL.
+* ⚡ **Uploads Paralelos Multithread (`-t`):** Envia múltiplos blocos (*chunks*) simultaneamente, aproveitando ao máximo a largura de banda da sua conexão.
+* 🔄 **Uploads Resumíveis (Resumable Uploads):** Em caso de queda de conexão ou interrupção manual (`Ctrl+C`), o script decodifica o bitmap do servidor e retoma exatamente da última parte pendente.
+* 🔑 **Renovação Automática de Sessão (`Token Refresh`):** Identifica expirações de sessão (`Error 105`) durante transferências longas e renova a autenticação em segundo plano sem interromper o fluxo.
+* ⚡ **Deduplicação Instantânea (Instant Upload):** Analisa o hash do arquivo local antes do envio; se o arquivo já existir no servidor, o upload é concluído instantaneamente e o link é gerado.
+* 🎮 **Menu Interativo Pós-Envio:** Ao finalizar a transferência dos blocos, escolha entre aguardar a liberação do link final, iniciar um novo upload imediatamente ou encerrar o script.
+* 📦 **Processamento em Lote (Batch Uploads):** Envie múltiplos arquivos em sequência dentro da mesma execução.
+* 🧠 **Gerenciamento Eficiente de Memória (`UnitFile`):** Transmite blocos utilizando buffers otimizados em memória RAM, sem carregar arquivos gigantescos por inteiro na memória do sistema.
+* 🛡️ **Tolerância a Falhas e Retentativas:** Executa até 5 tentativas automáticas por bloco em caso de erros temporários de rede.
+* 📊 **Interface Limpa & Logging Avançado:** Barra de progresso detalhada em tempo real com `tqdm` e registro completo de operações no arquivo `upload_mfcmd.log`.
 
 ---
 
-## Architecture & How It Works
+## 📐 Arquitetura & Fluxo de Operação
 
-```
+```text
                         ┌───────────────────────────────┐
-                        │      Initialize Session       │
+                        │    🔑 Autenticação na API     │
                         └───────────────┬───────────────┘
                                         │
                                         ▼
                         ┌───────────────────────────────┐
-                        │    Calculate Local Hashes     │
-                        │    (MD5 & Global SHA-256)     │
+                        │   🧮 Cálculo de Hashes Locais │
+                        │    (MD5 e Global SHA-256)     │
                         └───────────────┬───────────────┘
                                         │
                                         ▼
                         ┌───────────────────────────────┐
-                        │  Check MediaFire Upload State │
+                        │ 🔍 Verificação no MediaFire   │
                         └───────────────┬───────────────┘
                                         │
          ┌──────────────────────────────┴──────────────────────────────┐
          │                                                             │
-  [ Hash Exists? ]                                              [ New Upload ]
+  [ Arquivo Existe ]                                           [ Envio Necessário ]
          │                                                             │
          ▼                                                             ▼
 ┌─────────────────┐                                            ┌───────────────┐
-│ Instant Return  │                                            │ Decode Bitmap │
-│ Download Link   │                                            └───────┬───────┘
-└─────────────────┘                                                    │
+│ ⚡ Link Direto  │                                            │ 🗺️ Decodificar │
+│  Gerado         │                                            │   Bitmap      │
+└─────────────────┘                                            └───────┬───────┘
+                                                                       │
                                                                        ▼
-                                                              ┌─────────────────┐
-                                                     ┌───────►│  Upload Chunk   │
-                                                     │        └────────┬────────┘
-                                                     │                 │
-                                              [ More Chunks? ] ◄───────┘
-                                                     │
-                                                     ▼
-                                            ┌─────────────────┐
-                                            │  Poll Finalize  │
-                                            └────────┬────────┘
-                                                     │
-                                                     ▼
-                                            ┌─────────────────┐
-                                            │ Output Direct   │
-                                            │ Public URL      │
-                                            └─────────────────┘
+                                                               ┌───────────────┐
+                                                       ┌──────►│ 🧵 ThreadPool │
+                                                       │       │ Envio Paralelo│
+                                                       │       └───────┬───────┘
+                                                       │               │
+                                                [ Faltam Partes? ] ────┘
+                                                       │
+                                                       ▼
+                                               ┌───────────────┐
+                                               │ 🎮 Menu       │
+                                               │ Interativo &  │
+                                               │ Link Final    │
+                                               └───────────────┘
 ```
 
-1. **Authentication:** Connects to MediaFire using application ID `42511`.
-2. **Hash Check:** Calculates full-file SHA-256 and MD5.
-3. **Bitmap Decoding:** Requests `upload/check` from MediaFire to parse the 15-bit integer word array representing which chunks already reside on the server.
-4. **Chunked Streaming:** Uploads missing chunks using `UnitFile` in-memory buffers.
-5. **Polling:** Monitors the `upload_key` via `upload/poll` until MediaFire assigns a `quickkey` and generates the public link.
+---
+
+## 🛠️ Requisitos Prévios
+
+* **Python:** `3.6` ou superior
+* **Biblioteca Oficial:** `mediafire==0.6.1`
+* **Progresso em Terminal:** `tqdm`
 
 ---
 
-## Requirements
+## 📦 Instalação
 
-* **Python:** `3.6` or higher
-* **Dependencies:**
-  * `mediafire==0.6.1`
-  * `tqdm`
-
----
-
-## Installation
-
-1. **Clone the repository:**
+1. **Clone o repositório:**
    ```bash
-   git clone https://github.com/bx758/mfcmd.git
+   git clone [https://github.com/bx758/mfcmd.git](https://github.com/bx758/mfcmd.git)
    cd mfcmd
    ```
 
-2. **Install requirements:**
+2. **Instale as dependências:**
    ```bash
    pip install mediafire==0.6.1 tqdm
    ```
 
 ---
 
-## Usage
+## 💻 Como Usar
 
 ```bash
-python3 mfcmd.py -e <email> -p <password> -f <filepath> [options]
+python3 mfcmd.py -e <email> [-p <senha>] -f <caminho_do_arquivo> [opções]
 ```
 
-### Command-Line Arguments
+### 📋 Parâmetros e Sinalizadores (Flags)
 
-| Flag | Long Flag | Description | Required | Default |
-|---|---|---|---|---|
-| `-e` | `--email` | Your MediaFire account email address. | **Yes** | — |
-| `-p` | `--password` | Your MediaFire account password. | **Yes** | — |
-| `-f` | `--file` | Path to the local file to upload. | **Yes** | — |
-| `-u` | `--upload-folder` | Target folder name on MediaFire. | No | `My Files` |
-| `-h` | `--hash` | Pre-calculated SHA-256 string (skips local hash calculation). | No | Computed automatically |
+| Parâmetro | Sinalizador | Descrição | Obrigatório | Padrão |
+| :--- | :--- | :--- | :---: | :---: |
+| `-e` | `--email` | E-mail cadastrado na conta MediaFire | **Sim** | — |
+| `-p` | `--password` | Senha da conta *(solicitada no terminal se omitida)* | Não | — |
+| `-f` | `--file` | Caminho do arquivo local para upload | **Sim** | — |
+| `-u` | `--upload-folder` | Pasta de destino no MediaFire | Não | `My Files` |
+| `-t` | `--threads` | Número de uploads simultâneos (*threads*) | Não | `4` |
+| `-s` | `--hash` | SHA-256 pré-calculado *(pula o cálculo local)* | Não | Automático |
 
 ---
 
-## Examples
+## 💡 Exemplos Práticos
 
-### Basic File Upload
-Upload a file to the default root directory (`My Files`):
+### 1. Upload Simples
+Envia um arquivo diretamente para a pasta raiz (`My Files`):
 ```bash
 python3 mfcmd.py \
-    -e "user@example.com" \
-    -p "YourPassword123" \
-    -f "backup.zip"
+    -e "usuario@exemplo.com" \
+    -p "SuaSenhaSegura" \
+    -f "backup_sistema.zip"
 ```
 
-### Upload to a Specific Folder
-Upload a file directly into a subfolder named `Backups`:
+### 2. Upload de Alta Velocidade em Pasta Específica
+Acelera o envio de um arquivo grande usando **8 threads paralelas** dentro da pasta `Filmes`:
 ```bash
 python3 mfcmd.py \
-    -e "user@example.com" \
-    -p "YourPassword123" \
-    -u "Backups" \
-    -f "database_dump.sql.gz"
+    -e "usuario@exemplo.com" \
+    -u "Filmes" \
+    -t 8 \
+    -f "video_4k.mkv"
 ```
 
-### Skip Local Hashing (Pre-calculated SHA-256)
-If you already computed the SHA-256 hash of a large file, pass it via `-h` to start uploading immediately:
-```bash
-python3 mfcmd.py \
-    -e "user@example.com" \
-    -p "YourPassword123" \
-    -h "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" \
-    -f "ubuntu-desktop.iso"
-```
+### 3. Envio de Todos os Arquivos de uma Pasta (Modo Lote)
+
+* **No Windows (PowerShell):**
+  ```powershell
+  Get-ChildItem "C:\MeusArquivos\*" -File | ForEach-Object { python mfcmd.py -e "usuario@exemplo.com" -f $_.FullName -u "MinhaPasta" }
+  ```
+
+* **No Linux / macOS (Bash):**
+  ```bash
+  for file in /caminho/da/pasta/*; do
+      [ -f "$file" ] && python3 mfcmd.py -e "usuario@exemplo.com" -f "$file" -u "MinhaPasta"
+  done
+  ```
 
 ---
 
-## Exit Status Codes
+## 🚦 Códigos de Saída (Exit Status)
 
-`mfcmd.py` returns standard exit codes for integration into shell scripts or CI/CD pipelines:
-
-| Code | Status | Meaning |
-|---|---|---|
-| `0` | **SUCCESS** | File uploaded or instant duplicate match found; URL printed to stdout. |
-| `1` | **ERROR** | Validation failed, login rejected, or upload retries exhausted. |
-| `130` | **INTERRUPTED** | Interrupted by user (`SIGINT` / `Ctrl+C`). Server retains uploaded units. |
+| Código | Status | Descrição |
+| :---: | :--- | :--- |
+| `0` | **SUCESSO** | Upload concluído, duplicata detectada ou menu finalizado corretamente. |
+| `1` | **ERRO** | Falha de autenticação, arquivo não encontrado ou conexão perdida irrecuperável. |
+| `130` | **INTERROMPIDO** | Cancelado pelo usuário (`Ctrl+C`). O progresso já enviado permanece no servidor para retoma posterior. |
 
 ---
 
-## License
+## 📄 Licença
 
-Distributed under the [MIT License](LICENSE).
+Este projeto está sob a licença [MIT](LICENSE). Conteúdo livre para modificação e distribuição.
+``────``
